@@ -2,293 +2,418 @@
 
 namespace Net\Zabbix;
 
+use InvalidArgumentException;
 use Net\Zabbix\Exception\SenderNetworkException;
 use Net\Zabbix\Exception\SenderProtocolException;
 
-class Sender {
+class Sender
+{
+	/** @var string */
+	private $serverName;
+	/** @var int */
+	private $serverPort;
+	/** @var int */
+	private $timeout = 30;
 
-    private $_servername;
-    private $_serverport;
+	/** @var string */
+	private $protocolHeaderString = 'ZBXD';
+	/** @var int */
+	private $protocolVersion = 1;
 
-    private $_timeout = 30;
+	/** @var null */
+	private $lastResponseInfo;
+	/** @var null */
+	private $lastResponseArray;
+	/** @var null */
+	private $lastProcessed;
+	/** @var null */
+	private $lastFailed;
+	/** @var null */
+	private $lastSpent;
+	/** @var null */
+	private $lastTotal;
 
-    private $_protocolHeaderString = 'ZBXD';
-    private $_protocolVersion      = 1;
+	/** @filesource */
+	private $socket;
+	private $data;
 
-    private $_lastResponseInfo  = null;
-    private $_lastResponseArray = null;
-    private $_lastProcessed     = null;
-    private $_lastFailed        = null;
-    private $_lastSpent         = null;
-    private $_lastTotal         = null;
 
-    private $_socket;
-    private $_data;
+	/**
+	 * @param  string $servername
+	 * @param  integer $serverport
+	 */
+	public function __construct($servername = 'localhost', $serverport = 10051)
+	{
+		$this->setServerName($servername);
+		$this->setServerPort($serverport);
+		$this->initData();
+	}
 
-    /**
-     * __construct
-     *
-     * @param  string  $servername
-     * @param  integer $serverport
-     * @return void
-     */
-    function __construct($servername = 'localhost', $serverport = 10051)
-    {
-        $this->setServerName($servername);
-        $this->setServerPort($serverport);
-        $this->initData();
-    }
-    
-    function initData()
-    {
-        $this->_data = array(
-            "request" => "sender data",
-            "data" => array()
-        );
-    }
 
-    function importAgentConfig(Agent\Config $agentConfig)
-    {
-        $this->setServerName($agentConfig->getServer());
-        $this->setServerPort($agentConfig->getServerPort());
-        return $this;
-    }
-    
-    function setServerName($servername){
-        $this->_servername = $servername;
-        return $this;
-    }
-    
-    function setServerPort($serverport){
-        if (is_int($serverport)) {
-            $this->_serverport = $serverport;
-        }
-        return $this;
-    }
-    
-    function setTimeout($timeout=0){
-        if( (is_int($timeout) or is_numeric($timeout) ) and intval($timeout) > 0){
-            $this->_timeout = $timeout;
-        }
-        return $this;
-    }   
+	/**
+	 * main
+	 * @throws SenderNetworkException
+	 * @throws SenderProtocolException
+	 *
+	 */
+	public function send()
+	{
+		$sendData = $this->_buildSendData();
+		$datasize = strlen($sendData);
 
-    function getTimeout(){
-        return $this->_timeout;
-    }
+		$this->connect();
 
-    function setProtocolHeaderString($headerString){
-        $this->_protocolHeaderString = $headerString;
-        return $this;
-    }
+		/* send data to zabbix server */
+		$sentsize = $this->write($this->socket, $sendData);
+		if ($sentsize === false or $sentsize != $datasize) {
+			throw new SenderNetworkException('cannot receive response');
+		}
 
-    function setProtocolVersion($version){
-        if (is_int($version) and $version > 0) {
-            $this->_protocolVersion = $version;
-        }
-        return $this;
-    }
+		/* receive data from zabbix server */
+		$recvData = $this->read($this->socket);
+		if ($recvData === false) {
+			throw new SenderNetworkException('cannot receive response');
+		}   
 
-    function addData($hostname=null,$key=null,$value=null,$clock=null)
-    {
-        $input = array("host"=>$hostname,"value"=>$value,"key"=>$key);
-        if( isset($clock) ){
-            $input{"clock"} = $clock;
-        }
-        array_push($this->_data{"data"},$input);
-        return $this;
-    }
-    
-    function getDataArray()
-    {
-        return $this->_data{"data"};
-    }
+		$this->connectionClose();
 
-    private function _buildSendData(){
-        $json_data   = json_encode( array_map(
-                                        function($t){ return is_string($t) ? utf8_encode($t) : $t; },
-                                        $this->_data
-                                    ) 
-                                );
-        $json_length = strlen($json_data);
-        $data_header = pack("aaaaCV2",
-                                substr($this->_protocolHeaderString,0,1),
-                                substr($this->_protocolHeaderString,1,1),
-                                substr($this->_protocolHeaderString,2,1),
-                                substr($this->_protocolHeaderString,3,1),
-                                intval($this->_protocolVersion),
-                                $json_length,
-                                ($json_length >> 32)
-                            );
-        return ($data_header . $json_data);
-    }
+		$recvProtocolHeader = substr($recvData, 0, 4);
+		if ($recvProtocolHeader === "ZBXD") {
+			$responseData = substr($recvData, 13);
+			$responseArray = json_decode($responseData, true);
+			if ($responseArray === null) {
+				throw new SenderProtocolException('Invalid json data in receive data');
+			}
+			$this->lastResponseArray = $responseArray;
+			$this->lastResponseInfo = $responseArray['info'];
+			$parsedInfo = $this->parseResponseinfo($this->lastResponseInfo);
+			$this->lastProcessed = $parsedInfo['processed'];
+			$this->lastFailed = $parsedInfo['failed'];
+			$this->lastSpent = $parsedInfo['spent'];
+			$this->lastTotal = $parsedInfo['total'];
+			if ($responseArray['response'] === 'success') {
+				$this->initData();
+				return true;
+			} else {
+				$this->clearLastResponseData();
+				return false;
+			}
+		} else {
+			$this->clearLastResponseData();
+			throw new SenderProtocolException('invalid protocol header in receive data');
+		}
+	}
 
-    protected function _parseResponseInfo($info=null){
-        # info: "Processed 1 Failed 1 Total 2 Seconds spent 0.000035"
-        $parsedInfo = null;       
-        if(isset($info)){
-            list(,$processed,,$failed,,$total,,,$spent) = explode(" ",$info);
-            $parsedInfo = array(
-                "processed" => intval($processed),
-                "failed"    => intval($failed),
-                "total"     => intval($total),
-                "spent"     => $spent,
-            );
-        }
-        return $parsedInfo;
-    }
-    
-    function getLastResponseInfo(){
-        return $this->_lastResponseInfo;
-    }   
-    
-    function getLastResponseArray(){
-        return $this->_lastResponseArray;
-    }   
-    
-    function getLastProcessed(){
-        return $this->_lastProcessed;
-    }
 
-    function getLastFailed(){
-        return $this->_lastFailed;
-    }
+	/**
+	 * @param Agent\ZabbixConfigurator $agentConfig
+	 * @return $this
+	 */
+	public function importAgentConfig(Agent\ZabbixConfigurator $agentConfig)
+	{
+		$this->setServerName($agentConfig->getZabbixServer());
+		$this->setServerPort($agentConfig->getServerPort());
+		return $this;
+	}
 
-    function getLastSpent(){
-        return $this->_lastSpent;
-    }
 
-    function getLastTotal(){
-        return $this->_lastTotal;
-    }
-    
-    private function _clearLastResponseData(){
-        $this->_lastResponseInfo    = null;
-        $this->_lastResponseArray   = null;
-        $this->_lastProcessed       = null;
-        $this->_lastFailed          = null;
-        $this->_lastSpent           = null;
-        $this->_lastTotal           = null;
-    }
+	public function initData()
+	{
+		$this->data = [
+			'request' => 'sender data',
+			'data' => [],
+		];
+	}
 
-    private function _close(){
-        if($this->_socket){
-            fclose($this->_socket);
-        }
-    }
 
-    /**
-     * connect to Zabbix Server
-     * @throws Net\Zabbix\Exception\SenderNetworkException
-     *
-     */
-    private function _connect(){
-        $this->_socket = @fsockopen( $this->_servername,
-                                        intval($this->_serverport),
-                                        $errno,
-                                        $errmsg,
-                                        $this->_timeout);
-        if(! $this->_socket){
-            throw new SenderNetworkException(sprintf('%s,%s',$errno,$errmsg));
-        }
-    }
-    
-    /**
-     * write data to socket
-     * @throws Net\Zabbix\Exception\SenderNetworkException
-     *
-     */
-    private function _write($socket,$data){
-        if(! $socket){
-            throw new SenderNetworkException('socket was not writable,connect failed.');
-        }
-        $totalWritten = 0;
-        $length = strlen($data);
-        while( $totalWritten < $length ){
-            $writeSize = @fwrite($socket,$data);
-            if($writeSize === false){
-                return false;
-            }else{
-                $totalWritten += $writeSize;
-                $data = substr($data,$writeSize);
-            }
-        }
-        return $totalWritten; 
-    }
+	/**
+	 * @param null|string $hostname
+	 * @param null|string $key
+	 * @param null|string|int $value
+	 * @param $clock
+	 * @return $this
+	 */
+	public function addData($hostname = null, $key = null, $value = null, $clock = null)
+	{
+		$input = [
+			'host' => $hostname,
+			'value' => $value,
+			'key' => $key,
+		];
+		if ($clock !== null) {
+			$input['clock'] = $clock;
+		}
+		$this->data['data'][] = $input;
+		return $this;
+	}
 
-    /**
-     * read data from socket
-     * @throws Net\Zabbix\Exception\SenderNetworkException
-     *
-     */ 
-    private function _read($socket){
-        if(! $socket){
-            throw new SenderNetworkException('socket was not readable,connect failed.');
-        }
-        $recvData = "";
-        while(!feof($socket)){
-            $buffer = fread($socket,8192);
-            if($buffer === false){
-                return false; 
-            }
-            $recvData .= $buffer;
-        }
-        return $recvData; 
-    }
-    
 
-    /**
-     * main 
-     * @throws Net\Zabbix\Exception\SenderNetworkException
-     * @throws Net\Zabbix\Exception\SenderProtocolException
-     *
-     */ 
-    function send(){
-        $sendData = $this->_buildSendData();
-        $datasize = strlen($sendData);
- 
-        $this->_connect();
-      
-        /* send data to zabbix server */ 
-        $sentsize = $this->_write($this->_socket,$sendData);
-        if($sentsize === false or $sentsize != $datasize){
-            throw new SenderNetworkException('cannot receive response');
-        }
-        
-        /* receive data from zabbix server */ 
-        $recvData = $this->_read($this->_socket);
-        if($recvData === false){
-            throw new SenderNetworkException('cannot receive response');
-        }
-        
-        $this->_close();
-        
-        $recvProtocolHeader = substr($recvData,0,4);
-        if( $recvProtocolHeader == "ZBXD"){
-            $responseData               = substr($recvData,13);
-            $responseArray              = json_decode($responseData,true);
-            if(is_null($responseArray)){
-                throw new SenderProtocolException('invalid json data in receive data'); 
-            }
-            $this->_lastResponseArray   = $responseArray;
-            $this->_lastResponseInfo    = $responseArray{'info'}; 
-            $parsedInfo                 = $this->_parseResponseInfo($this->_lastResponseInfo); 
-            $this->_lastProcessed       = $parsedInfo{'processed'};
-            $this->_lastFailed          = $parsedInfo{'failed'};
-            $this->_lastSpent           = $parsedInfo{'spent'};
-            $this->_lastTotal           = $parsedInfo{'total'};
-            if($responseArray{'response'} == "success"){
-                $this->initData();
-                return true;
-            }else{
-                $this->_clearLastResponseData();
-                return false; 
-            }
-        }else{
-            $this->_clearLastResponseData();
-            throw new SenderProtocolException('invalid protocol header in receive data'); 
-        }
-    }
+	/**
+	 * @return mixed
+	 */
+	public function getDataArray()
+	{
+		return $this->data['data'];
+	}
+
+
+	/**
+	 * @return string
+	 */
+	private function _buildSendData()
+	{
+		$json_data = json_encode(array_map(
+				function ($t) {
+					return is_string($t) ? utf8_encode($t) : $t;
+				},
+				$this->data
+			)
+		);
+		$json_length = strlen($json_data);
+		$data_header = pack('aaaaCV2',
+			$this->protocolHeaderString[0],
+			$this->protocolHeaderString[1],
+			$this->protocolHeaderString[2],
+			$this->protocolHeaderString[3],
+			(int)$this->protocolVersion,
+			$json_length,
+			$json_length >> 32
+		);
+		return ($data_header . $json_data);
+	}
+
+
+	/**
+	 * @param null $info
+	 * @return array|null
+	 */
+	protected function parseResponseinfo($info = null)
+	{
+		# info: "Processed 1 Failed 1 Total 2 Seconds spent 0.000035"
+		$parsedInfo = null;
+		if ($info !== null) {
+			list(, $processed, , $failed, , $total, , , $spent) = explode(' ', $info);
+			$parsedInfo = [
+				'processed' => (int)$processed,
+				'failed' => (int)$failed,
+				'total' => (int)$total,
+				'spent' => $spent,
+			];
+		}
+		return $parsedInfo;
+	}
+
+
+	private function clearLastResponseData()
+	{
+		$this->lastResponseInfo = null;
+		$this->lastResponseArray = null;
+		$this->lastProcessed = null;
+		$this->lastFailed = null;
+		$this->lastSpent = null;
+		$this->lastTotal = null;
+	}
+
+
+	private function connectionClose()
+	{
+		if ($this->socket) {
+			fclose($this->socket);
+		}
+	}
+
+
+	/**
+	 * Connect to Zabbix server
+	 * @throws SenderNetworkException
+	 *
+	 */
+	private function connect()
+	{
+		$this->socket = @fsockopen($this->serverName,
+			(int)$this->serverPort,
+			$errno,
+			$errmsg,
+			$this->timeout);
+		if (!$this->socket) {
+			throw new SenderNetworkException($errmsg);
+		}
+	}
+
+
+	/**
+	 * Write data to socket
+	 * @param $socket
+	 * @param $data
+	 * @return bool|int
+	 * @throws \Net\Zabbix\Exception\SenderNetworkException
+	 */
+	private function write($socket, $data)
+	{
+		if (!$socket) {
+			throw new SenderNetworkException('Socket is not writable, connection failed.');
+		}
+		$totalWritten = 0;
+		$length = strlen($data);
+		while ($totalWritten < $length) {
+			$writeSize = @fwrite($socket, $data);
+			if ($writeSize === false) {
+				return false;
+			} else {
+				$totalWritten += $writeSize;
+				$data = substr($data, $writeSize);
+			}
+		}
+		return $totalWritten;
+	}
+
+
+	/**
+	 * Read data from socket
+	 * @param $socket
+	 * @return bool|string
+	 * @throws \Net\Zabbix\Exception\SenderNetworkException
+	 */
+	private function read($socket)
+	{
+		if (!$socket) {
+			throw new SenderNetworkException('socket was not readable,connect failed.');
+		}
+		$recvData = '';
+		while (!feof($socket)) {
+			$buffer = fread($socket, 8192);
+			if ($buffer === false) {
+				return false;
+			}
+			$recvData .= $buffer;
+		}
+		return $recvData;
+	}
+
+
+	/**
+	 * @param $serverName
+	 * @return $this
+	 */
+	public function setServerName($serverName)
+	{
+		$this->serverName = $serverName;
+		return $this;
+	}
+
+
+	/**
+	 * @param int $serverPort
+	 * @return $this
+	 * @throws InvalidArgumentException
+	 */
+	public function setServerPort($serverPort)
+	{
+		if (is_int($serverPort)) {
+			$this->serverPort = $serverPort;
+		}
+		return $this;
+	}
+
+
+	/**
+	 * @param int $timeout
+	 * @return $this
+	 */
+	public function setTimeout($timeout = 0)
+	{
+		if ((is_int($timeout) or is_numeric($timeout)) and intval($timeout) > 0) {
+			$this->timeout = $timeout;
+		}
+		return $this;
+	}
+
+
+	/**
+	 * @return int
+	 */
+	public function getTimeout()
+	{
+		return $this->timeout;
+	}
+
+
+	/**
+	 * @param $headerString
+	 * @return $this
+	 */
+	public function setProtocolHeaderString($headerString)
+	{
+		$this->protocolHeaderString = $headerString;
+		return $this;
+	}
+
+
+	/**
+	 * @param $version
+	 * @return $this
+	 */
+	public function setProtocolVersion($version)
+	{
+		if (is_int($version) and $version > 0) {
+			$this->protocolVersion = $version;
+		}
+		return $this;
+	}
+
+
+	/**
+	 * @return null
+	 */
+	public function getLastResponseInfo()
+	{
+		return $this->lastResponseInfo;
+	}
+
+
+	/**
+	 * @return null|array
+	 */
+	public function getLastResponseArray()
+	{
+		return $this->lastResponseArray;
+	}
+
+
+	/**
+	 * @return null
+	 */
+	public function getLastProcessed()
+	{
+		return $this->lastProcessed;
+	}
+
+
+	/**
+	 * @return null
+	 */
+	public function getLastFailed()
+	{
+		return $this->lastFailed;
+	}
+
+
+	/**
+	 * @return null
+	 */
+	public function getLastSpent()
+	{
+		return $this->lastSpent;
+	}
+
+
+	/**
+	 * @return null
+	 */
+	public function getLastTotal()
+	{
+		return $this->lastTotal;
+	}
 }
 
 
