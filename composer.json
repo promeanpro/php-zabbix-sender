@@ -1,7 +1,7 @@
 {
-  "name": "promeanpro/zabbix-sender",
+  "name": "promeanpro/php-zabbix-sender",
   "type": "library",
-  "homepage": "https://github.com/okitsu/php-zabbix-sender",
+  "homepage": "https://github.com/promenapro/php-zabbix-sender",
   "license": "MIT",
   "authors": [
     {
