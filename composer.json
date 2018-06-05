@@ -1,5 +1,5 @@
 {
-  "name": "kth5/zabbix-sender",
+  "name": "promeanpro/zabbix-sender",
   "type": "library",
   "homepage": "https://github.com/okitsu/php-zabbix-sender",
   "license": "MIT",
